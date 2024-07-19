@@ -1,0 +1,308 @@
+version: "3.8"
+
+services:
+   read:
+      image: grafana/loki:2.9.2
+      command: "-config.file=/etc/loki/config.yml -target=read"
+      ports:
+         - "3101:3100"
+         - "7946"
+         - "9095"
+      volumes:
+         - ./observability/loki/loki-config.yml:/etc/loki/config.yml
+      depends_on:
+         - minio
+      healthcheck:
+         test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1" ]
+         interval: 10s
+         timeout: 5s
+         retries: 5
+      networks: &loki-dns
+         loki:
+            aliases:
+               - loki
+
+   write:
+      image: grafana/loki:2.9.2
+      command: "-config.file=/etc/loki/config.yml -target=write"
+      ports:
+         - "3102:3100"
+         - "7946"
+         - "9095"
+      volumes:
+         - ./observability/loki/loki-config.yml:/etc/loki/config.yml
+      healthcheck:
+         test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1" ]
+         interval: 10s
+         timeout: 5s
+         retries: 5
+      depends_on:
+         - minio
+      networks:
+         <<: *loki-dns
+
+   promtail:
+      image: grafana/promtail:2.9.2
+      volumes:
+         - ./observability/promtail/promtail-local-config.yml:/etc/promtail/config.yml:ro
+         - /var/run/docker.sock:/var/run/docker.sock
+      command: -config.file=/etc/promtail/config.yml
+      depends_on:
+         - gateway
+      networks:
+         - loki
+
+   minio:
+      image: minio/minio
+      entrypoint:
+         - sh
+         - -euc
+         - |
+            mkdir -p /data/loki-data && \
+            mkdir -p /data/loki-ruler && \
+            minio server /data
+      environment:
+         - MINIO_ROOT_USER=loki
+         - MINIO_ROOT_PASSWORD=supersecret
+         - MINIO_PROMETHEUS_AUTH_TYPE=public
+         - MINIO_UPDATE=off
+      ports:
+         - 9000
+      volumes:
+         - ./.data/minio:/data
+      healthcheck:
+         test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+         interval: 15s
+         timeout: 20s
+         retries: 5
+      networks:
+         - loki
+
+   prometheus:
+      image: prom/prometheus:v2.45.0
+      container_name: prometheus
+      ports:
+         - "9090:9090"
+      volumes:
+         - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      networks:
+         - loki
+
+#   tempo:
+#      image: grafana/tempo
+#      container_name: tempo
+#      command: -config.file /etc/tempo-config.yml
+#      ports:
+#         - "3110:3100"
+#         - "4317:4317"
+#      volumes:
+#         - ./observability/tempo/tempo.yml:/etc/tempo-config.yml
+
+   grafana:
+      image: grafana/grafana:latest
+      environment:
+         - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+         - GF_AUTH_ANONYMOUS_ENABLED=true
+         - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      depends_on:
+         - gateway
+      entrypoint:
+         - sh
+         - -euc
+         - |
+           /run.sh
+      ports:
+         - "3000:3000"
+      volumes:
+         - ./observability/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+      healthcheck:
+         test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1" ]
+         interval: 10s
+         timeout: 5s
+         retries: 5
+      networks:
+         - loki
+
+   gateway:
+      image: nginx:latest
+      depends_on:
+         - read
+         - write
+      entrypoint:
+         - sh
+         - -euc
+         - |
+            cat <<EOF > /etc/nginx/nginx.conf
+            user  nginx;
+            worker_processes  5;  ## Default: 1
+            
+            events {
+              worker_connections   1000;
+            }
+            
+            http {
+              resolver 127.0.0.11;
+            
+              server {
+                listen             3100;
+            
+                location = / {
+                  return 200 'OK';
+                  auth_basic off;
+                }
+            
+                location = /api/prom/push {
+                  proxy_pass       http://write:3100\$$request_uri;
+                }
+            
+                location = /api/prom/tail {
+                  proxy_pass       http://read:3100\$$request_uri;
+                  proxy_set_header Upgrade \$$http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                }
+            
+                location ~ /api/prom/.* {
+                  proxy_pass       http://read:3100\$$request_uri;
+                }
+            
+                location = /loki/api/v1/push {
+                  proxy_pass       http://write:3100\$$request_uri;
+                }
+            
+                location = /loki/api/v1/tail {
+                  proxy_pass       http://read:3100\$$request_uri;
+                  proxy_set_header Upgrade \$$http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                }
+            
+                location ~ /loki/api/.* {
+                  proxy_pass       http://read:3100\$$request_uri;
+                }
+              }
+            }
+            EOF
+            /docker-entrypoint.sh nginx -g "daemon off;"
+      ports:
+         - "3100:3100"
+      healthcheck:
+         test: [ "CMD", "service", "nginx", "status" ]
+         interval: 10s
+         timeout: 5s
+         retries: 5
+      networks:
+         - loki
+
+   movie-services-registry:
+      build: ./movie-services-registry
+      container_name: movie-services-registry
+       # you can use command `docker compose up --build` to build and run the image.
+      ports:
+         - "8761:8761"
+      healthcheck:
+         test: "curl --fail --silent localhost:8761/actuator/health/readiness | grep UP || exit 0"
+         interval: 20s
+         timeout: 5s
+         retries: 20
+         start_period: 10s
+      environment:
+         - SERVER_PORT=8761
+         - APPLICATION_NAME=movie-services-registry
+         - REGISTER_WITH_EUREKA=false
+         - FETCH_REGISTRY=false
+#         - OTEL_SERVICE_NAME=movie-services-registry
+#      extends:
+#         file: common-config.yml
+#         service: microservices-base-config
+      networks:
+         - loki
+
+   booking-service:
+      build: ./booking-service
+      container_name: booking-service
+      ports:
+         - "8080:8080"
+      depends_on:
+         movie-services-registry:
+            condition: service_healthy
+         api-gateway:
+            condition: service_healthy
+         payment-service:
+            condition: service_healthy
+      environment:
+         - SERVER_PORT=8080
+         - APPLICATION_NAME=booking-service
+         - REGISTER_WITH_EUREKA=true
+         - DEFAULT_ZONE=http://movie-services-registry:8761/eureka/
+#         - OTEL_SERVICE_NAME=booking-service
+#      extends:
+#         file: common-config.yml
+#         service: microservices-base-config
+      networks:
+         - loki
+
+   payment-service:
+      build: ./payment-service
+      container_name: payment-service
+      ports:
+         - "8081:8081"
+      healthcheck:
+         test: "curl --fail --silent localhost:8081/actuator/health/readiness | grep UP || exit 0"
+         interval: 20s
+         timeout: 5s
+         retries: 20
+         start_period: 10s
+      depends_on:
+         movie-services-registry:
+            condition: service_healthy
+         api-gateway:
+            condition: service_healthy
+      environment:
+         - SERVER_PORT=8081
+         - APPLICATION_NAME=payment-service
+         - REGISTER_WITH_EUREKA=true
+         - DEFAULT_ZONE=http://movie-services-registry:8761/eureka
+#         - OTEL_SERVICE_NAME=payment-service
+#      extends:
+#         file: common-config.yml
+#         service: microservices-base-config
+      networks:
+         - loki
+
+#   notification-service:
+#      build: ./notification-service
+#      container_name: notification-service
+#      ports:
+#         - "8082:8082"
+#      environment:
+#         - SERVER_PORT=8082
+#         - APPLICATION_NAME=notification-service
+#         - REGISTER_WITH_EUREKA=true
+#         - DEFAULT_ZONE=http://movie-services-registry:8761/eureka/
+
+   api-gateway:
+      build: ./api-gateway
+      ports:
+         - "8765:8765"
+      depends_on:
+         movie-services-registry:
+            condition: service_healthy
+      healthcheck:
+         test: "curl --fail --silent localhost:8765/actuator/health/readiness | grep UP || exit 0"
+         interval: 20s
+         timeout: 5s
+         retries: 20
+         start_period: 10s
+      environment:
+         SERVER_PORT: 8765
+         APPLICATION_NAME: api-gateway
+         REGISTER_WITH_EUREKA: true
+         DEFAULT_ZONE: http://movie-services-registry:8761/eureka/
+#         OTEL_SERVICE_NAME: api-gateway
+#      extends:
+#         file: common-config.yml
+#         service: microservices-base-config
+      networks:
+         - loki
+
+networks:
+   loki:
